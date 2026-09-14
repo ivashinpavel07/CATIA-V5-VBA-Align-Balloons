@@ -1,0 +1,1017 @@
+﻿'
+' ****************************************************************************
+' CATIA V5 SmartAlignBalloons v0.9
+' RUBBER-BAND GUIDE + STEP-BY-STEP ALIGN AFTER SECOND CLICK
+' OPTIONAL POSITIONAL LINK REMOVAL + OPTIONAL MIDDLE-CENTER ANCHOR
+'
+' Workflow:
+'   1) Select DrawingText Balloons with Leaders.
+'   2) Dialog #1:
+'        Yes    -> remove Positional Links before alignment
+'        No     -> keep Positional Links
+'        Cancel -> exit
+'   3) Dialog #2:
+'        Yes    -> set Balloon text AnchorPosition = Middle Center
+'        No     -> preserve current AnchorPosition
+'        Cancel -> exit
+'   4) Click START point.
+'   5) A BLACK DASHED Line2D (Line Type 2) is immediately created.
+'      While the mouse moves, ONLY this temporary line is recreated.
+'      Balloons are NOT moved during mouse tracking.
+'   6) Second left click fixes the END point.
+'   7) Only then SmartAlign starts placing Balloons ONE BY ONE.
+'      After each Balloon CATIA refreshes the viewer, so the user sees
+'      how the row is filled step by step.
+'   8) After the last Balloon is placed, the temporary line is deleted.
+'
+' Why recreate the line on MouseMove?
+'   In the diagnostic v0.7 the following properties were verified to produce
+'   the desired appearance in the user's CATIA installation:
+'
+'       SetRealColor    0,0,0,0
+'       SetRealLineType 2,0
+'       SetRealWidth    1,0
+'
+'   Earlier live versions tried to modify the endpoints of the same line.
+'   CATIA did not reliably keep/display the desired graphic properties.
+'   v0.8 therefore follows a "delete old temporary line -> create new one ->
+'   style it again" rubber-band pattern.
+'
+' AnchorPosition:
+'   CatTextAnchorPosition order in V5Automation:
+'     catTopLeft       = 1
+'     catMiddleLeft    = 2
+'     catBottomLeft    = 3
+'     catTopCenter     = 4
+'     catMiddleCenter  = 5
+'   CATScript uses numeric value 5 for robustness.
+' ****************************************************************************
+
+
+Sub CATMain()
+
+    If TypeName(CATIA.ActiveDocument) <> "DrawingDocument" Then
+        MsgBox "Open a CATDrawing document before running SmartAlignBalloons.", _
+               vbExclamation, "SmartAlignBalloons"
+        Exit Sub
+    End If
+
+    Dim doc, sel, sheet, activeView, factory2D
+
+    Set doc = CATIA.ActiveDocument
+    Set sel = doc.Selection
+    Set sheet = doc.Sheets.ActiveSheet
+    Set activeView = sheet.Views.ActiveView
+    Set factory2D = activeView.Factory2D
+
+    ' -------------------------------------------------------------------------
+    ' 1. Select DrawingText Balloons.
+    ' -------------------------------------------------------------------------
+    Dim filter(0), status
+
+    filter(0) = "DrawingText"
+
+    sel.Clear
+
+    status = sel.SelectElement3( _
+        filter, _
+        "Select DrawingText Balloons with Leaders, then validate the selection", _
+        False, _
+        CATMultiSelTriggWhenUserValidatesSelection, _
+        False)
+
+    If status = "Cancel" Or status = "Undo" Or status = "Redo" Then
+        sel.Clear
+        Exit Sub
+    End If
+
+    If sel.Count2 = 0 Then
+        MsgBox "No DrawingText objects were selected.", _
+               vbExclamation, "SmartAlignBalloons"
+        Exit Sub
+    End If
+
+    ' -------------------------------------------------------------------------
+    ' 2. Snapshot selected objects.
+    ' -------------------------------------------------------------------------
+    Dim maxCount
+
+    maxCount = sel.Count2
+
+    Dim texts()
+    Dim originalX(), originalY()
+    Dim originalAnchor()
+    Dim anchorX(), anchorY()
+    Dim hadAssoc(), assocObjects()
+
+    ReDim texts(maxCount - 1)
+    ReDim originalX(maxCount - 1)
+    ReDim originalY(maxCount - 1)
+    ReDim originalAnchor(maxCount - 1)
+    ReDim anchorX(maxCount - 1)
+    ReDim anchorY(maxCount - 1)
+    ReDim hadAssoc(maxCount - 1)
+    ReDim assocObjects(maxCount - 1)
+
+    Dim n, i
+    Dim obj, leader, headPt, linkedObj
+
+    n = 0
+
+    For i = 1 To sel.Count2
+
+        Set obj = sel.Item2(i).Value
+
+        If TypeName(obj) = "DrawingText" Then
+
+            If obj.Leaders.Count > 0 Then
+
+                If MSA_TextBelongsToActiveView(obj, activeView) Then
+
+                    Set texts(n) = obj
+
+                    originalX(n) = CDbl(obj.X)
+                    originalY(n) = CDbl(obj.Y)
+
+                    On Error Resume Next
+                    Err.Clear
+                    originalAnchor(n) = CLng(obj.AnchorPosition)
+                    If Err.Number <> 0 Then
+                        Err.Clear
+                        originalAnchor(n) = -1
+                    End If
+                    On Error GoTo 0
+
+                    Set leader = obj.Leaders.Item(1)
+
+                    headPt = MSA_GetLeaderHeadPoint(leader)
+
+                    anchorX(n) = CDbl(headPt(0))
+                    anchorY(n) = CDbl(headPt(1))
+
+                    ' Save original Positional Link, if any.
+                    hadAssoc(n) = False
+                    Set linkedObj = Nothing
+
+                    On Error Resume Next
+                    Err.Clear
+
+                    Set linkedObj = obj.AssociativeElement
+
+                    If Err.Number = 0 Then
+                        If Not linkedObj Is Nothing Then
+
+                            hadAssoc(n) = True
+                            Set assocObjects(n) = linkedObj
+
+                        End If
+                    End If
+
+                    Err.Clear
+                    On Error GoTo 0
+
+                    n = n + 1
+
+                End If
+            End If
+        End If
+    Next
+
+    sel.Clear
+
+    If n < 2 Then
+        MsgBox "Select at least two DrawingText objects with Leaders in the active view.", _
+               vbExclamation, "SmartAlignBalloons"
+        Exit Sub
+    End If
+
+    ' -------------------------------------------------------------------------
+    ' 3. Dialog #1 - Positional Link.
+    '    Ask BEFORE changing the drawing so Cancel leaves everything untouched.
+    ' -------------------------------------------------------------------------
+    Dim linkChoice
+
+    linkChoice = MsgBox( _
+        "Remove Positional Link from the selected Balloons before alignment?" & vbCrLf & vbCrLf & _
+        "YES  - remove Positional Links." & vbCrLf & _
+        "       Recommended if some Balloons refuse to move." & vbCrLf & vbCrLf & _
+        "NO   - keep Positional Links unchanged." & vbCrLf & vbCrLf & _
+        "CANCEL - stop the macro.", _
+        vbYesNoCancel + vbQuestion, _
+        "SmartAlignBalloons - Positional Link")
+
+    If linkChoice = vbCancel Then
+        Exit Sub
+    End If
+
+    ' -------------------------------------------------------------------------
+    ' 4. Dialog #2 - text anchor.
+    ' -------------------------------------------------------------------------
+    Dim centerChoice
+
+    centerChoice = MsgBox( _
+        "Set Anchor Point of the selected Balloon texts to MIDDLE CENTER?" & vbCrLf & vbCrLf & _
+        "YES  - set AnchorPosition = catMiddleCenter." & vbCrLf & _
+        "       Recommended for circular Balloons: the alignment coordinate" & vbCrLf & _
+        "       will pass through the visual center of each Balloon." & vbCrLf & vbCrLf & _
+        "NO   - preserve the current Anchor Point of every text." & vbCrLf & vbCrLf & _
+        "CANCEL - stop the macro.", _
+        vbYesNoCancel + vbQuestion, _
+        "SmartAlignBalloons - Balloon Center")
+
+    If centerChoice = vbCancel Then
+        Exit Sub
+    End If
+
+    Dim linksWereRemoved
+    Dim removedLinks
+
+    linksWereRemoved = False
+    removedLinks = 0
+
+    ' -------------------------------------------------------------------------
+    ' 5. Remove Positional Links if requested.
+    ' -------------------------------------------------------------------------
+    If linkChoice = vbYes Then
+
+        removedLinks = MSA_RemovePositionalLinks(texts, n, activeView, sel)
+        linksWereRemoved = True
+
+        ' Removing the association can rebuild annotation geometry.
+        ' Refresh the Leader arrow/head coordinates AFTER removal.
+        Call MSA_RefreshLeaderHeadPoints(texts, anchorX, anchorY, n)
+
+    End If
+
+    ' -------------------------------------------------------------------------
+    ' 6. First click.
+    ' -------------------------------------------------------------------------
+    Dim startPt(1)
+
+    status = doc.Indicate2D( _
+        "SmartAlignBalloons: click the START point", _
+        startPt)
+
+    If status = "Cancel" Or status = "Undo" Or status = "Redo" Then
+
+        If linksWereRemoved Then
+            Call MSA_RestorePositionalLinks(texts, hadAssoc, assocObjects, n)
+        End If
+
+        Exit Sub
+    End If
+
+    ' -------------------------------------------------------------------------
+    ' 7. Create a first tiny black dashed temporary line immediately after
+    '    the first click.
+    ' -------------------------------------------------------------------------
+    Dim guideLine
+
+    Set guideLine = MSA_CreateTemporaryGuide( _
+        factory2D, sel, _
+        CDbl(startPt(0)), CDbl(startPt(1)), _
+        CDbl(startPt(0)) + 0.01, CDbl(startPt(1)))
+
+    If guideLine Is Nothing Then
+
+        If linksWereRemoved Then
+            Call MSA_RestorePositionalLinks(texts, hadAssoc, assocObjects, n)
+        End If
+
+        MsgBox "Could not create the temporary alignment line.", _
+               vbExclamation, "SmartAlignBalloons"
+
+        Exit Sub
+    End If
+
+    ' -------------------------------------------------------------------------
+    ' 8. Rubber-band preview.
+    '    ONLY the line follows the mouse.  No Balloon is moved here.
+    ' -------------------------------------------------------------------------
+    Dim pointFilter(0)
+    Dim mousePt(1)
+    Dim objectSelected
+
+    Dim lastX, lastY
+    Dim moveDX, moveDY
+    Dim minMove
+
+    pointFilter(0) = "Point2D"
+
+    lastX = CDbl(startPt(0))
+    lastY = CDbl(startPt(1))
+
+    ' Prevent excessive create/delete cycles for sub-pixel mouse movement.
+    minMove = 0.15
+
+    CATIA.StatusBar = _
+        "SmartAlignBalloons: move cursor to define the line; second click starts distribution."
+
+    On Error Resume Next
+    Err.Clear
+
+    status = sel.IndicateOrSelectElement2D( _
+        "Move cursor: dashed line = distribution span. Click END point. Esc = cancel.", _
+        pointFilter, _
+        False, _
+        False, _
+        True, _
+        objectSelected, _
+        mousePt)
+
+    If Err.Number <> 0 Then
+
+        ' MouseMove mode unavailable in this V5 level -> fallback to simple
+        ' second Indicate2D.
+        Err.Clear
+        On Error GoTo 0
+
+        Call MSA_DeleteGuide(sel, guideLine)
+
+        status = doc.Indicate2D( _
+            "Live line preview unavailable. Click the END point.", _
+            mousePt)
+
+        If status = "Cancel" Or status = "Undo" Or status = "Redo" Then
+
+            If linksWereRemoved Then
+                Call MSA_RestorePositionalLinks(texts, hadAssoc, assocObjects, n)
+            End If
+
+            Exit Sub
+        End If
+
+        Set guideLine = MSA_CreateTemporaryGuide( _
+            factory2D, sel, _
+            CDbl(startPt(0)), CDbl(startPt(1)), _
+            CDbl(mousePt(0)), CDbl(mousePt(1)))
+
+    Else
+
+        On Error GoTo 0
+
+        Do
+
+            If status = "MouseMove" Then
+
+                If Not objectSelected Then
+
+                    moveDX = CDbl(mousePt(0)) - lastX
+                    moveDY = CDbl(mousePt(1)) - lastY
+
+                    If (moveDX * moveDX + moveDY * moveDY) >= _
+                       (minMove * minMove) Then
+
+                        If MSA_VectorIsValid( _
+                            startPt(0), startPt(1), _
+                            mousePt(0), mousePt(1)) Then
+
+                            ' Important:
+                            ' do NOT modify old line endpoints.
+                            ' Delete it and create a fresh styled Line2D.
+                            Call MSA_DeleteGuide(sel, guideLine)
+
+                            Set guideLine = MSA_CreateTemporaryGuide( _
+                                factory2D, sel, _
+                                CDbl(startPt(0)), CDbl(startPt(1)), _
+                                CDbl(mousePt(0)), CDbl(mousePt(1)))
+
+                            lastX = CDbl(mousePt(0))
+                            lastY = CDbl(mousePt(1))
+
+                            On Error Resume Next
+                            CATIA.ActiveWindow.ActiveViewer.Update
+                            Err.Clear
+                            On Error GoTo 0
+
+                        End If
+                    End If
+                End If
+
+                ' Wait for next mouse event.
+                On Error Resume Next
+                Err.Clear
+
+                status = sel.IndicateOrSelectElement2D( _
+                    "Move cursor: dashed line = distribution span. Click END point. Esc = cancel.", _
+                    pointFilter, _
+                    False, _
+                    False, _
+                    True, _
+                    objectSelected, _
+                    mousePt)
+
+                If Err.Number <> 0 Then
+                    Err.Clear
+                    status = "Cancel"
+                End If
+
+                On Error GoTo 0
+
+            ElseIf status = "Normal" Then
+
+                ' If the second click selects a Point2D, use its exact coordinates.
+                If objectSelected Then
+
+                    On Error Resume Next
+
+                    Dim selectedPoint
+
+                    Set selectedPoint = sel.Item2(1).Value
+
+                    selectedPoint.GetCoordinates mousePt
+
+                    sel.Clear
+
+                    Err.Clear
+                    On Error GoTo 0
+
+                End If
+
+                Exit Do
+
+            ElseIf status = "Cancel" Or status = "Undo" Or status = "Redo" Then
+
+                Call MSA_DeleteGuide(sel, guideLine)
+
+                If linksWereRemoved Then
+                    Call MSA_RestorePositionalLinks(texts, hadAssoc, assocObjects, n)
+                End If
+
+                CATIA.StatusBar = "SmartAlignBalloons: cancelled."
+                Exit Sub
+
+            Else
+
+                Exit Do
+
+            End If
+
+        Loop
+
+        ' Fix line to the exact second-click position.
+        Call MSA_DeleteGuide(sel, guideLine)
+
+        Set guideLine = MSA_CreateTemporaryGuide( _
+            factory2D, sel, _
+            CDbl(startPt(0)), CDbl(startPt(1)), _
+            CDbl(mousePt(0)), CDbl(mousePt(1)))
+
+    End If
+
+    ' -------------------------------------------------------------------------
+    ' 9. Validate final vector.
+    ' -------------------------------------------------------------------------
+    If Not MSA_VectorIsValid( _
+        startPt(0), startPt(1), _
+        mousePt(0), mousePt(1)) Then
+
+        Call MSA_DeleteGuide(sel, guideLine)
+
+        If linksWereRemoved Then
+            Call MSA_RestorePositionalLinks(texts, hadAssoc, assocObjects, n)
+        End If
+
+        MsgBox "The alignment line is too short.", _
+               vbExclamation, "SmartAlignBalloons"
+
+        Exit Sub
+    End If
+
+    ' -------------------------------------------------------------------------
+    ' 10. Second click has happened.
+    '     NOW optionally switch text anchor to Middle Center.
+    '
+    '     Numeric 5 = catMiddleCenter in CatTextAnchorPosition.
+    ' -------------------------------------------------------------------------
+    If centerChoice = vbYes Then
+
+        Call MSA_SetMiddleCenter(texts, n)
+
+    End If
+
+    ' -------------------------------------------------------------------------
+    ' 11. One exact SmartAlign calculation.
+    ' -------------------------------------------------------------------------
+    CATIA.StatusBar = _
+        "SmartAlignBalloons: placing Balloons step by step..."
+
+    Call MSA_ApplyLayoutOnce( _
+        texts, anchorX, anchorY, n, _
+        CDbl(startPt(0)), CDbl(startPt(1)), _
+        CDbl(mousePt(0)), CDbl(mousePt(1)))
+
+    ' -------------------------------------------------------------------------
+    ' 12. Distribution complete -> delete temporary line.
+    ' -------------------------------------------------------------------------
+    Call MSA_DeleteGuide(sel, guideLine)
+
+    CATIA.RefreshDisplay = True
+
+    On Error Resume Next
+    CATIA.ActiveWindow.ActiveViewer.Update
+    Err.Clear
+    On Error GoTo 0
+
+    sel.Clear
+
+    If linksWereRemoved Then
+
+        CATIA.StatusBar = _
+            "SmartAlignBalloons: done. " & CStr(n) & _
+            " Balloons aligned; Positional Links removed."
+
+    Else
+
+        CATIA.StatusBar = _
+            "SmartAlignBalloons: done. " & CStr(n) & _
+            " Balloons aligned; Positional Links kept."
+
+    End If
+
+End Sub
+
+
+' =============================================================================
+' Set DrawingText AnchorPosition to catMiddleCenter.
+'
+' In CatTextAnchorPosition enum catMiddleCenter is the sixth member when the
+' leading unused value is counted, therefore its numeric value is 5.
+' Numeric assignment avoids dependence on enum-name resolution in CATScript.
+' =============================================================================
+Sub MSA_SetMiddleCenter(texts, count)
+
+    Dim i
+
+    On Error Resume Next
+    Err.Clear
+
+    For i = 0 To count - 1
+
+        Err.Clear
+        texts(i).AnchorPosition = 5
+
+    Next
+
+    Err.Clear
+    On Error GoTo 0
+
+End Sub
+
+
+' =============================================================================
+' Read first Leader path point via GetPoints.
+' =============================================================================
+Function MSA_GetLeaderHeadPoint(leader)
+
+    Dim nbPts
+    Dim pathPts()
+    Dim outPt(1)
+    Dim returnedPts
+
+    nbPts = CLng(leader.NbPoint)
+
+    If nbPts < 1 Then
+
+        Err.Raise vbObjectError + 2101, _
+                  "MSA_GetLeaderHeadPoint", _
+                  "The selected DrawingLeader does not contain path points."
+
+    End If
+
+    ReDim pathPts((nbPts * 2) - 1)
+
+    returnedPts = leader.GetPoints(pathPts)
+
+    If returnedPts < 1 Then
+
+        Err.Raise vbObjectError + 2102, _
+                  "MSA_GetLeaderHeadPoint", _
+                  "DrawingLeader.GetPoints returned no points."
+
+    End If
+
+    outPt(0) = CDbl(pathPts(0))
+    outPt(1) = CDbl(pathPts(1))
+
+    MSA_GetLeaderHeadPoint = outPt
+
+End Function
+
+
+' =============================================================================
+' Refresh Leader arrow/head coordinates after association removal.
+' =============================================================================
+Sub MSA_RefreshLeaderHeadPoints(texts, anchorX, anchorY, count)
+
+    Dim i
+    Dim leader
+    Dim headPt
+
+    For i = 0 To count - 1
+
+        Set leader = texts(i).Leaders.Item(1)
+
+        headPt = MSA_GetLeaderHeadPoint(leader)
+
+        anchorX(i) = CDbl(headPt(0))
+        anchorY(i) = CDbl(headPt(1))
+
+    Next
+
+End Sub
+
+
+' =============================================================================
+' Remove Positional Links.
+'
+' Automation workaround:
+'   selected DrawingText -> temporary DrawingText
+'   delete temporary DrawingText
+' =============================================================================
+Function MSA_RemovePositionalLinks(texts, count, activeView, sel)
+
+    Dim i
+    Dim dmy
+    Dim linkedObj
+    Dim linkCount
+
+    linkCount = 0
+
+    For i = 0 To count - 1
+
+        Set linkedObj = Nothing
+
+        On Error Resume Next
+        Err.Clear
+
+        Set linkedObj = texts(i).AssociativeElement
+
+        If Err.Number = 0 Then
+            If Not linkedObj Is Nothing Then
+                linkCount = linkCount + 1
+            End If
+        End If
+
+        Err.Clear
+        On Error GoTo 0
+
+    Next
+
+    On Error Resume Next
+    Err.Clear
+
+    CATIA.HSOSynchronized = False
+
+    Set dmy = activeView.Texts.Add("MSA_POSLINK_TEMP", 0, 0)
+
+    If Err.Number = 0 Then
+
+        For i = 0 To count - 1
+
+            Err.Clear
+            texts(i).AssociativeElement = dmy
+
+        Next
+
+        sel.Clear
+        sel.Add dmy
+        sel.Delete
+        sel.Clear
+
+    End If
+
+    CATIA.HSOSynchronized = True
+
+    Err.Clear
+    On Error GoTo 0
+
+    MSA_RemovePositionalLinks = linkCount
+
+End Function
+
+
+' =============================================================================
+' Restore Positional Links if user cancels before alignment.
+' =============================================================================
+Sub MSA_RestorePositionalLinks(texts, hadAssoc, assocObjects, count)
+
+    Dim i
+
+    On Error Resume Next
+    Err.Clear
+
+    CATIA.HSOSynchronized = False
+
+    For i = 0 To count - 1
+
+        If hadAssoc(i) Then
+
+            Err.Clear
+            texts(i).AssociativeElement = assocObjects(i)
+
+        End If
+
+    Next
+
+    CATIA.HSOSynchronized = True
+
+    Err.Clear
+    On Error GoTo 0
+
+End Sub
+
+
+' =============================================================================
+' Create ONE temporary guide Line2D and force the properties that were verified
+' in v0.7:
+'
+'   black
+'   CATIA line type 2
+'   width index 1
+'
+' The line is restyled every time it is recreated.
+' =============================================================================
+Function MSA_CreateTemporaryGuide(factory2D, sel, x1, y1, x2, y2)
+
+    Dim lineObj
+    Dim vis
+
+    Set lineObj = Nothing
+
+    On Error Resume Next
+    Err.Clear
+
+    Set lineObj = factory2D.CreateLine(x1, y1, x2, y2)
+
+    If Err.Number <> 0 Then
+
+        Err.Clear
+        Set lineObj = Nothing
+
+        On Error GoTo 0
+
+        Set MSA_CreateTemporaryGuide = lineObj
+        Exit Function
+
+    End If
+
+    lineObj.Name = "MSA_TEMP_ALIGNMENT_GUIDE"
+
+    sel.Clear
+    sel.Add lineObj
+
+    Set vis = sel.VisProperties
+
+    ' Verified diagnostic values from v0.7.
+    vis.SetRealColor 0, 0, 0, 0
+    vis.SetRealLineType 2, 0
+    vis.SetRealWidth 1, 0
+
+    sel.Clear
+
+    Err.Clear
+    On Error GoTo 0
+
+    Set MSA_CreateTemporaryGuide = lineObj
+
+End Function
+
+
+' =============================================================================
+' Delete temporary guide.
+' =============================================================================
+Sub MSA_DeleteGuide(sel, lineObj)
+
+    If lineObj Is Nothing Then Exit Sub
+
+    On Error Resume Next
+    Err.Clear
+
+    sel.Clear
+    sel.Add lineObj
+    sel.Delete
+    sel.Clear
+
+    Err.Clear
+    On Error GoTo 0
+
+End Sub
+
+
+'
+' =============================================================================
+' Apply layout after the SECOND click with VISIBLE STEP-BY-STEP placement.
+'
+' Important:
+'   - there is still NO Balloon movement while the mouse is defining the line;
+'   - the fixed dashed guide remains visible during the complete operation;
+'   - for every target point, all remaining Balloons are evaluated again;
+'   - exactly ONE Balloon is moved;
+'   - the viewer is refreshed;
+'   - only then does the algorithm continue to the next target.
+'
+' This intentionally mirrors the visible behavior of the original VBA macro:
+'
+'      N candidates -> choose -> move 1 -> show
+'    N-1 candidates -> choose -> move 1 -> show
+'    N-2 candidates -> choose -> move 1 -> show
+'    ...
+'
+' The final ordering principle is unchanged.
+' =============================================================================
+Sub MSA_ApplyLayoutOnce( _
+    texts, anchorX, anchorY, count, _
+    startX, startY, endX, endY)
+
+    Dim dx, dy
+    Dim len2
+    Dim stepX, stepY
+
+    dx = endX - startX
+    dy = endY - startY
+
+    len2 = dx * dx + dy * dy
+
+    If len2 < 0.000001 Then Exit Sub
+
+    stepX = dx / (count + 1)
+    stepY = dy / (count + 1)
+
+    Dim remaining()
+    ReDim remaining(count - 1)
+
+    Dim i
+
+    For i = 0 To count - 1
+        remaining(i) = True
+    Next
+
+    Dim slot
+    Dim targetX, targetY
+
+    Dim bestIndex
+    Dim bestDot, bestB2
+
+    Dim bx, by
+    Dim b2
+    Dim dotValue
+
+    Dim candidateBetter
+    Dim leftValue, rightValue
+
+    Dim currentText
+
+    ' We WANT every completed placement to be visible.
+    CATIA.RefreshDisplay = True
+
+    For slot = 1 To count
+
+        targetX = startX + stepX * slot
+        targetY = startY + stepY * slot
+
+        bestIndex = -1
+        bestDot = 0
+        bestB2 = 0
+
+        ' ---------------------------------------------------------------------
+        ' Recalculate ALL still-unplaced Balloons for THIS target.
+        ' ---------------------------------------------------------------------
+        For i = 0 To count - 1
+
+            If remaining(i) Then
+
+                bx = anchorX(i) - targetX
+                by = anchorY(i) - targetY
+
+                b2 = bx * bx + by * by
+                dotValue = dx * bx + dy * by
+
+                candidateBetter = False
+
+                If bestIndex < 0 Then
+
+                    candidateBetter = True
+
+                ElseIf b2 <= 0.000000001 Then
+
+                    candidateBetter = False
+
+                ElseIf bestB2 <= 0.000000001 Then
+
+                    candidateBetter = True
+
+                ElseIf dotValue < 0 And bestDot >= 0 Then
+
+                    candidateBetter = True
+
+                ElseIf dotValue >= 0 And bestDot < 0 Then
+
+                    candidateBetter = False
+
+                Else
+
+                    leftValue = dotValue * dotValue * bestB2
+                    rightValue = bestDot * bestDot * b2
+
+                    If dotValue < 0 Then
+
+                        If leftValue > rightValue Then
+                            candidateBetter = True
+                        End If
+
+                    Else
+
+                        If leftValue < rightValue Then
+                            candidateBetter = True
+                        End If
+
+                    End If
+
+                End If
+
+                If candidateBetter Then
+
+                    bestIndex = i
+                    bestDot = dotValue
+                    bestB2 = b2
+
+                End If
+
+            End If
+
+        Next
+
+        ' ---------------------------------------------------------------------
+        ' Move ONE Balloon and immediately show the result.
+        ' ---------------------------------------------------------------------
+        If bestIndex >= 0 Then
+
+            Set currentText = texts(bestIndex)
+
+            currentText.X = targetX
+            currentText.Y = targetY
+
+            remaining(bestIndex) = False
+
+            CATIA.StatusBar = _
+                "SmartAlignBalloons: placing " & CStr(slot) & _
+                " / " & CStr(count)
+
+            ' Force the current step onto the screen before proceeding.
+            On Error Resume Next
+            CATIA.ActiveWindow.ActiveViewer.Update
+            Err.Clear
+            On Error GoTo 0
+
+        End If
+
+    Next
+
+    CATIA.RefreshDisplay = True
+
+End Sub
+
+
+' =============================================================================
+' Geometry helper.
+' =============================================================================
+Function MSA_VectorIsValid(x1, y1, x2, y2)
+
+    Dim dx, dy
+
+    dx = CDbl(x2) - CDbl(x1)
+    dy = CDbl(y2) - CDbl(y1)
+
+    MSA_VectorIsValid = ((dx * dx + dy * dy) > 0.000001)
+
+End Function
+
+
+' =============================================================================
+' Check selected text belongs to active DrawingView.
+' =============================================================================
+Function MSA_TextBelongsToActiveView(txt, activeView)
+
+    Dim txtView, parent1
+
+    MSA_TextBelongsToActiveView = True
+
+    On Error Resume Next
+    Err.Clear
+
+    Set parent1 = txt.Parent
+    Set txtView = parent1.Parent
+
+    If Err.Number = 0 Then
+
+        If txtView.Name <> activeView.Name Then
+            MSA_TextBelongsToActiveView = False
+        End If
+
+    End If
+
+    Err.Clear
+    On Error GoTo 0
+
+End Function
